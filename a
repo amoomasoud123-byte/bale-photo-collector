@@ -1,0 +1,156 @@
+{
+  "name": "bale-photo-collector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Collect Bale group photos, download them, and save metadata.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = process.env.PORT || 3000;
+const BALE_TOKEN = process.env.BALE_TOKEN;
+const BASE_DIR = __dirname;
+const PHOTO_DIR = path.join(BASE_DIR, 'photos');
+const DATA_DIR = path.join(BASE_DIR, 'data');
+const LOG_FILE = path.join(DATA_DIR, 'photos.jsonl');
+
+if (!BALE_TOKEN) {
+  console.error('ERROR: BALE_TOKEN is not set.');
+  process.exit(1);
+}
+
+fs.mkdirSync(PHOTO_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function safeName(s) {
+  return String(s || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function appendJsonl(obj) {
+  fs.appendFileSync(LOG_FILE, JSON.stringify(obj) + '\n', 'utf8');
+}
+
+async function bale(method, params = {}) {
+  const url = new URL(`https://tapi.bale.ai/bot${BALE_TOKEN}/${method}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, String(value));
+  }
+  const response = await fetch(url);
+  const data = await response.json();
+  if (!data.ok) throw new Error(`Bale ${method} failed: ${JSON.stringify(data)}`);
+  return data.result;
+}
+
+async function downloadPhoto(filePath, destination) {
+  const url = `https://tapi.bale.ai/file/bot${BALE_TOKEN}/${filePath}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Image download failed: HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(destination, buffer);
+  return buffer.length;
+}
+
+function pickBestPhoto(message) {
+  if (Array.isArray(message.photo) && message.photo.length) {
+    return message.photo.reduce((best, current) =>
+      (!best || (current.file_size || 0) > (best.file_size || 0)) ? current : best, null);
+  }
+  if (message.document && String(message.document.mime_type || '').startsWith('image/')) {
+    return message.document;
+  }
+  return null;
+}
+
+async function processUpdate(update) {
+  const message = update.message;
+  if (!message) return { ignored: true, reason: 'no_message' };
+
+  const image = pickBestPhoto(message);
+  if (!image) return { ignored: true, reason: 'not_an_image' };
+
+  const chat = message.chat || {};
+  const sender = message.from || {};
+  const fileId = image.file_id;
+  const fileInfo = await bale('getFile', { file_id: fileId });
+
+  const ext = message.document?.mime_type === 'image/png' ? '.png' : '.jpg';
+  const originalName = message.document?.file_name || `bale_${update.update_id}${ext}`;
+  const localName = `${update.update_id}_${message.message_id}_${safeName(originalName)}`;
+  const localPath = path.join(PHOTO_DIR, localName);
+  const bytes = await downloadPhoto(fileInfo.file_path, localPath);
+
+  const record = {
+    photo_id: `${chat.id}_${message.message_id}`,
+    update_id: update.update_id,
+    message_id: message.message_id,
+    group_id: chat.id || '',
+    group_name: chat.title || '',
+    chat_type: chat.type || '',
+    sender_id: sender.id || '',
+    sender_name: [sender.first_name, sender.last_name].filter(Boolean).join(' '),
+    date_unix: message.date || null,
+    file_id: fileId,
+    file_path: fileInfo.file_path,
+    original_file_name: message.document?.file_name || null,
+    mime_type: message.document?.mime_type || 'image/jpeg',
+    width: image.width || null,
+    height: image.height || null,
+    original_file_size: image.file_size || null,
+    downloaded_bytes: bytes,
+    caption: message.caption || '',
+    local_file: `photos/${localName}`,
+    received_at: new Date().toISOString()
+  };
+
+  appendJsonl(record);
+  return { saved: true, record };
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: true, service: 'bale-photo-collector' }));
+    }
+
+    if (req.method === 'POST' && req.url === '/bale/webhook') {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      let update;
+      try {
+        update = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+
+      processUpdate(update)
+        .then(result => console.log('Processed:', JSON.stringify(result)))
+        .catch(error => console.error('Processing error:', error));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+  } catch (error) {
+    console.error(error);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'server_error' }));
+    }
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Bale photo collector listening on port ${PORT}`);
+  console.log(`Webhook endpoint: POST /bale/webhook`);
+  console.log(`Health check: GET /health`);
+});
