@@ -1,0 +1,13 @@
+{
+  "name": "bale-photo-collector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Collect Bale group photos, download them, and save metadata.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
